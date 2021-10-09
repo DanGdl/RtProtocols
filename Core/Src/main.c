@@ -19,7 +19,6 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
-#include "cmsis_os.h"
 #include "i2c.h"
 #include "lwip.h"
 #include "spi.h"
@@ -74,7 +73,6 @@ PUTCHAR_PROTOTYPE {
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
-void MX_FREERTOS_Init(void);
 /* USER CODE BEGIN PFP */
 void udp_rx_callback(void *arg, struct udp_pcb *upcb, struct pbuf *p, ip_addr_t *addr, u16_t port);
 
@@ -88,28 +86,23 @@ void transmit_payload(int protocol, uint8_t* payload, size_t len);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+uint8_t timer_elapsed = 0;
 uint8_t i2c_full = 0;
 uint8_t spi_full = 0;
 uint8_t uart_full = 0;
 
-extern osThreadId_t request_taskHandle;
+uint8_t buffers[3];
+
 const int server_port = 10;
 extern struct netif gnetif; // my addr
 struct udp_pcb* server_sock = NULL;
 
 ip_addr_t sender_addr;
 u16_t sender_port = 0;
+int socket_collected = 0;
 char socket_data[255] = {0};
-
-uint8_t* payload = NULL;
-int protocol = -1;
-size_t len = 0;
-
 uint8_t last_buffer[BUFFER_SIZE] = {0};
-
-uint8_t uart_buff[BUFFER_SIZE] = {0};
-uint8_t i2c_buff[BUFFER_SIZE] = {0};
-uint8_t spi_buff[BUFFER_SIZE] = {0};
 /* USER CODE END 0 */
 
 /**
@@ -145,22 +138,82 @@ int main(void)
   MX_I2C2_Init();
   MX_SPI4_Init();
   MX_SPI1_Init();
-  MX_TIM2_Init();
+  MX_LWIP_Init();
   MX_UART5_Init();
   MX_UART7_Init();
+  MX_TIM4_Init();
   /* USER CODE BEGIN 2 */
+  HAL_TIM_Base_Start_IT(&htim4);
+
+	uint8_t uart_buff[BUFFER_SIZE] = {0};
+	uint8_t i2c_buff[BUFFER_SIZE] = {0};
+	uint8_t spi_buff[BUFFER_SIZE] = {0};
+
+	server_sock = udp_new();
+	udp_bind(server_sock, &gnetif.ip_addr, server_port);
+	udp_recv(server_sock, (udp_recv_fn) udp_rx_callback, NULL);
+
+	uint8_t* payload = NULL;
+	int protocol = -1;
+	size_t len = 0;
+
+	//  test code
+	//  size_t len = 8;
+	//	uint8_t* payload = malloc(sizeof(uint8_t) * (len + 1));
+	//	memset(payload, '\0', (len + 1));
+	//	memcpy(payload, "Payload1", len);
+	//	int protocol = 1;
+	//	setup_protocols(protocol, uart_buff, i2c_buff, spi_buff, len);
   /* USER CODE END 2 */
 
-  /* Init scheduler */
-  osKernelInitialize();  /* Call init function for freertos objects (in freertos.c) */
-  MX_FREERTOS_Init();
-  /* Start scheduler */
-  osKernelStart();
-
-  /* We should never get here as control is now taken by the scheduler */
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
+	const int timer_half_period = htim4.Init.Period / 2;
   while (1) {
+	  // set ARP table for MAC addresses
+	  ethernetif_input(&gnetif);
+	  // printf("ip: %s\n\r", ip4addr_ntoa(&gnetif.ip_addr));
+
+	  if(socket_collected) {
+		  // fill buffers to allow drop
+		  transmit_payload(protocol, payload, len);
+
+		  printf("sender ip: %s:%d, data: %s\n\r", ip4addr_ntoa(&sender_addr), sender_port, socket_data);
+
+		  char* separator_idx = strstr(socket_data, ",");
+		  socket_data[separator_idx - socket_data] = '\0';
+		  protocol = atoi(socket_data);
+
+		  const char* data = &socket_data[(separator_idx - socket_data) + 1];
+		  const int prev_len = len;
+		  len = strlen(data);
+		  const int payload_size = sizeof(uint8_t) * (len + 1);
+		  if (payload == NULL) {
+			  payload = malloc(payload_size);
+		  } else if (len != prev_len) {
+			  payload = realloc(payload, payload_size);
+		  }
+		  memset(payload, '\0', len + 1);
+		  memcpy(payload, data, len);
+		  setup_protocols(protocol, uart_buff, i2c_buff, spi_buff, len);
+		  socket_collected = 0;
+	  }
+
+	  if (htim4.Instance -> CNT % timer_half_period == 0 && payload != NULL) {
+		  transmit_payload(protocol, payload, len);
+	  }
+
+	  if (uart_full || i2c_full || spi_full) {
+		  setup_protocols(protocol, uart_buff, i2c_buff, spi_buff, len);
+		  uart_full = 0;
+		  i2c_full = 0;
+		  spi_full = 0;
+	  }
+	  if (timer_elapsed) {
+		  // printf("timer %d\n\r", counter);
+		  timer_elapsed = 0;
+		  send_data(protocol, last_buffer);
+	  }
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -228,137 +281,19 @@ void SystemClock_Config(void)
 }
 
 /* USER CODE BEGIN 4 */
-void StartDefaultTask(void *argument)
-{
-  /* init code for LWIP */
-  MX_LWIP_Init();
-  /* USER CODE BEGIN StartDefaultTask */
-    server_sock = udp_new();
-    udp_bind(server_sock, &gnetif.ip_addr, server_port);
-    udp_recv(server_sock, (udp_recv_fn) udp_rx_callback, NULL);
-
-  /* Infinite loop */
-  for(;;) {
-	  // set ARP table for MAC addresses
-	  ethernetif_input(&gnetif);
-	  // printf("ip: %s\n\r", ip4addr_ntoa(&gnetif.ip_addr));
-
-	  if (htim2.Instance -> CNT % (htim2.Init.Period / 2) == 0 && payload != NULL) {
-		  transmit_payload(protocol, payload, len);
-	  }
-
-	  if (uart_full || i2c_full || spi_full) {
-		  setup_protocols(protocol, uart_buff, i2c_buff, spi_buff, len);
-		  uart_full = 0;
-		  i2c_full = 0;
-		  spi_full = 0;
-	  }
-	  osDelay(pdMS_TO_TICKS(1));
-  }
-  /* USER CODE END StartDefaultTask */
-}
 
 void transmit_payload(int protocol, uint8_t* payload, size_t len){
-  if (protocol == 1) {
-	  HAL_UART_Transmit(&huart7, payload, len, 100);
-  } else if (protocol == 2) {
-	  HAL_I2C_Master_Transmit(&hi2c1, 4, payload, len, 100);
-  } else if (protocol == 3) {
-	  HAL_SPI_Transmit(&hspi4, payload, len, 100);
-  }
-}
-
-// sending data by timer interrupt
-void send_to_network(void *argument) {
-  /* USER CODE BEGIN send_to_network */
-	osThreadSuspend(osThreadGetId());
-  /* Infinite loop */
-  for(;;)
-  {
-	  send_data(protocol, last_buffer);
-	  osThreadSuspend(osThreadGetId());
-  }
-  /* USER CODE END send_to_network */
-}
-
-void send_data(int protocol, uint8_t* buffer) {
-	if (protocol != 1 && protocol != 2 && protocol != 3) {
-		// printf("No protocol specified\n\r");
-		return;
-	}
-	size_t size = strlen((char*) buffer);
-	if (!size) {
-		// printf("Nothing to send\n\r");
-		return;
-	}
-	err_t is_connected = udp_connect(server_sock, &sender_addr, sender_port);
-	if (is_connected == ERR_OK) {
-	  struct pbuf* udp_buffer = pbuf_alloc(PBUF_TRANSPORT, size + 2, PBUF_RAM);
-	  if (udp_buffer != NULL) {
-		  memset(udp_buffer -> payload, '\0', size);
-		  memset(udp_buffer -> payload, protocol + '0', 1);
-		  memcpy(udp_buffer -> payload + 1, ",", 1);
-		  memcpy(udp_buffer -> payload + 2, buffer, size);
-		  if (udp_send(server_sock, udp_buffer)) {
-			  printf("Send failed\n\r");
-		  }
-		  pbuf_free(udp_buffer);
+	if (protocol > 0) {
+	  if (protocol == 1) {
+		  HAL_UART_Transmit(&huart7, payload, len, 100);
+	  } else if (protocol == 2) {
+		  HAL_I2C_Master_Transmit(&hi2c1, 4, payload, len, 100);
+	  } else if (protocol == 3) {
+		  HAL_SPI_Transmit(&hspi4, payload, len, 100);
 	  }
-	  udp_disconnect(server_sock);
 	}
 }
 
-
-
-/**
-  * @brief This function is called when an UDP datagram has been received on the port UDP_PORT.
-  * @param arg user supplied argument (udp_pcb.recv_arg)
-  * @param pcb the udp_pcb which received data
-  * @param p the packet buffer that was received
-  * @param addr the remote IP address from which the packet was received
-  * @param port the remote port from which the packet was received
-  * @retval None
-  */
-void udp_rx_callback(void *arg, struct udp_pcb *upcb, struct pbuf *p, ip_addr_t *addr, u16_t port) {
-	sender_addr = *addr;
-	sender_port = port;
-	memset(socket_data, 0, sizeof(socket_data));
-	memcpy(socket_data, p -> payload, p -> len);
-	pbuf_free(p);
-	osThreadResume(request_taskHandle);
-}
-
-// receive data from socket
-void handle_request(void *argument) {
-  /* USER CODE BEGIN handle_request */
-	osThreadSuspend(osThreadGetId());
-  /* Infinite loop */
-  for(;;) {
-	  // fill buffers to allow drop
-	  transmit_payload(protocol, payload, len);
-
-	  printf("sender ip: %s:%d, data: %s\n\r", ip4addr_ntoa(&sender_addr), sender_port, socket_data);
-
-	  char* separator_idx = strstr(socket_data, ",");
-	  socket_data[separator_idx - socket_data] = '\0';
-	  protocol = atoi(socket_data);
-
-	  const char* data = &socket_data[(separator_idx - socket_data) + 1];
-	  const int prev_len = len;
-	  len = strlen(data);
-	  const int payload_size = sizeof(uint8_t) * (len + 1);
-	  if (payload == NULL) {
-		  payload = malloc(payload_size);
-	  } else if (len != prev_len) {
-		  payload = realloc(payload, payload_size);
-	  }
-	  memset(payload, '\0', len + 1);
-	  memcpy(payload, data, len);
-	  setup_protocols(protocol, uart_buff, i2c_buff, spi_buff, len);
-	  osThreadSuspend(osThreadGetId());
-  }
-  /* USER CODE END handle_request */
-}
 
 void resotre_buffer(uint8_t* buffer, int size) {
 	memset(last_buffer, '\0', BUFFER_SIZE);
@@ -392,7 +327,58 @@ void setup_protocols(
 }
 
 
+void send_data(int protocol, uint8_t* buffer) {
+	if (protocol != 1 && protocol != 2 && protocol != 3) {
+		// printf("No protocol specified\n\r");
+		return;
+	}
+	size_t size = strlen((char*) buffer);
+	if (!size) {
+		// printf("Nothing to send\n\r");
+		return;
+	}
+	err_t is_connected = udp_connect(server_sock, &sender_addr, sender_port);
+	if (is_connected == ERR_OK) {
+	  struct pbuf* udp_buffer = pbuf_alloc(PBUF_TRANSPORT, size + 2, PBUF_RAM);
+	  if (udp_buffer != NULL) {
+		  memset(udp_buffer -> payload, '\0', size);
+		  memset(udp_buffer -> payload, protocol + '0', 1);
+		  memcpy(udp_buffer -> payload + 1, ",", 1);
+		  memcpy(udp_buffer -> payload + 2, buffer, size);
+		  if (udp_send(server_sock, udp_buffer)) {
+			  printf("Send failed\n\r");
+		  }
+		  pbuf_free(udp_buffer);
+	  }
+	  udp_disconnect(server_sock);
+	}
+}
 
+/**
+  * @brief This function is called when an UDP datagram has been received on the port UDP_PORT.
+  * @param arg user supplied argument (udp_pcb.recv_arg)
+  * @param pcb the udp_pcb which received data
+  * @param p the packet buffer that was received
+  * @param addr the remote IP address from which the packet was received
+  * @param port the remote port from which the packet was received
+  * @retval None
+  */
+void udp_rx_callback(void *arg, struct udp_pcb *upcb, struct pbuf *p, ip_addr_t *addr, u16_t port) {
+	sender_addr = *addr;
+	sender_port = port;
+	memset(socket_data, 0, sizeof(socket_data));
+	memcpy(socket_data, p -> payload, p -> len);
+	socket_collected = 1;
+	pbuf_free(p);
+}
+
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef* htim) {
+	if (htim -> Instance == TIM4) {
+		timer_elapsed = 1;
+	} else {
+		UNUSED(htim);
+	}
+}
 
 void HAL_SPI_RxCpltCallback(SPI_HandleTypeDef *hspi)
 {
@@ -425,6 +411,7 @@ void HAL_I2C_SlaveRxCpltCallback(I2C_HandleTypeDef *hi2c) {
 	}
 }
 
+
 /*
 (+) TxHalfCpltCallback        : Tx Half Complete Callback.
 (+) TxCpltCallback            : Tx Complete Callback.
@@ -447,9 +434,6 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
 		UNUSED(huart);
 	}
 }
-
-
-
 
 /* USER CODE END 4 */
 
