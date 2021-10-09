@@ -50,3 +50,12 @@ modules.order
 Module.symvers
 Mkfile.old
 dkms.conf
+.settings/
+Debug/
+Drivers/
+LWIP/
+Middlewares/
+Core/Startup/startup_stm32f746zgtx.s
+ArmProtocols Debug.launch
+STM32F746ZGTX_FLASH.ld
+STM32F746ZGTX_RAM.ld
